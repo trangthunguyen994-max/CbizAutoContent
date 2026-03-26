@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: cbiz-auto-content
+    ports:
+      - "3001:3000" # Map cổng 3001 trên máy thật vào cổng 3000 của container
+    environment:
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      - NODE_ENV=production
+    volumes:
+      - ./data:/app/data # Lưu trữ database SQLite để không bị mất dữ liệu khi restart
+    restart: always

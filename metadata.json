@@ -1,0 +1,5 @@
+{
+  "name": "Cbiz Auto Content Tool",
+  "description": "Tự động lấy tin hot từ Weibo, dùng AI viết lại nội dung tiếng Việt theo style drama hóng hớt để đăng Facebook.",
+  "requestFramePermissions": []
+}
