@@ -5,6 +5,10 @@ import Database from "better-sqlite3";
 import { Pool } from "pg";
 import cors from "cors";
 import dns from "dns";
+import dotenv from "dotenv";
+
+// Load environment variables from .env file
+dotenv.config();
 
 // Force IPv4 first to avoid ENETUNREACH on IPv6-only hostnames in some environments
 if (typeof dns.setDefaultResultOrder === 'function') {
@@ -67,6 +71,16 @@ if (databaseUrl) {
     console.warn("WARNING: Running on Render but DATABASE_URL is missing. SQLite will be used, but data will be lost on restart.");
   }
   console.log("Using SQLite (Local)...");
+  
+  // Clear DB on start if requested
+  if (process.env.CLEAR_DB_ON_START === "true") {
+    const fs = await import("fs");
+    if (fs.existsSync(dbPath)) {
+      console.log("Clearing existing SQLite database as requested...");
+      fs.unlinkSync(dbPath);
+    }
+  }
+  
   db = new Database(dbPath);
 }
 
