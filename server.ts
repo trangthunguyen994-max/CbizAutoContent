@@ -2,6 +2,7 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import Database from "better-sqlite3";
+import { Pool } from "pg";
 import cors from "cors";
 
 import axios from "axios";
@@ -38,17 +39,50 @@ const nvidia = new OpenAI({
 
 // Initialize Database
 const dbPath = process.env.DATABASE_PATH || "cbiz_content.db";
-const db = new Database(dbPath);
-db.exec(`
-  CREATE TABLE IF NOT EXISTS posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    original_title TEXT UNIQUE,
-    rewritten_content TEXT,
-    image_url TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    status TEXT DEFAULT 'pending'
-  )
-`);
+const databaseUrl = process.env.DATABASE_URL;
+
+let db: any;
+let isPostgres = false;
+
+if (databaseUrl) {
+  console.log("Using PostgreSQL (Supabase/Cloud)...");
+  db = new Pool({
+    connectionString: databaseUrl,
+    ssl: { rejectUnauthorized: false } // Required for Supabase/Render
+  });
+  isPostgres = true;
+} else {
+  console.log("Using SQLite (Local)...");
+  db = new Database(dbPath);
+}
+
+const initDb = async () => {
+  if (isPostgres) {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS posts (
+        id SERIAL PRIMARY KEY,
+        original_title TEXT UNIQUE,
+        rewritten_content TEXT,
+        image_url TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        status TEXT DEFAULT 'pending'
+      )
+    `);
+  } else {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        original_title TEXT UNIQUE,
+        rewritten_content TEXT,
+        image_url TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        status TEXT DEFAULT 'pending'
+      )
+    `);
+  }
+};
+
+initDb().catch(err => console.error("Database init error:", err));
 
 const app = express();
 app.use(express.json());
@@ -743,20 +777,37 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
   }
 });
 
-app.get(["/api/posts", "/api/posts/"], (req, res) => {
-  const posts = db.prepare("SELECT * FROM posts ORDER BY created_at DESC").all();
-  res.json(posts);
+app.get(["/api/posts", "/api/posts/"], async (req, res) => {
+  try {
+    if (isPostgres) {
+      const result = await db.query("SELECT * FROM posts ORDER BY created_at DESC");
+      res.json(result.rows);
+    } else {
+      const posts = db.prepare("SELECT * FROM posts ORDER BY created_at DESC").all();
+      res.json(posts);
+    }
+  } catch (error: any) {
+    res.status(500).json({ message: error.message });
+  }
 });
 
-app.post(["/api/posts", "/api/posts/"], (req, res) => {
+app.post(["/api/posts", "/api/posts/"], async (req, res) => {
   const { original_title, rewritten_content, image_url } = req.body;
   console.log(`Saving post: ${original_title}`);
   try {
-    const info = db.prepare("INSERT INTO posts (original_title, rewritten_content, image_url) VALUES (?, ?, ?)").run(original_title, rewritten_content, image_url);
-    console.log(`Post saved with ID: ${info.lastInsertRowid}`);
-    res.json({ id: info.lastInsertRowid });
+    if (isPostgres) {
+      const result = await db.query(
+        "INSERT INTO posts (original_title, rewritten_content, image_url) VALUES ($1, $2, $3) ON CONFLICT (original_title) DO UPDATE SET rewritten_content = $2, image_url = $3 RETURNING id",
+        [original_title, rewritten_content, image_url]
+      );
+      res.json({ id: result.rows[0].id });
+    } else {
+      const info = db.prepare("INSERT INTO posts (original_title, rewritten_content, image_url) VALUES (?, ?, ?)").run(original_title, rewritten_content, image_url);
+      console.log(`Post saved with ID: ${info.lastInsertRowid}`);
+      res.json({ id: info.lastInsertRowid });
+    }
   } catch (error: any) {
-    if (error.code === 'SQLITE_CONSTRAINT') {
+    if (error.code === 'SQLITE_CONSTRAINT' || error.code === '23505') {
       console.warn(`Post already exists: ${original_title}`);
       res.status(409).json({ message: "Post already exists" });
     } else {
@@ -766,21 +817,45 @@ app.post(["/api/posts", "/api/posts/"], (req, res) => {
   }
 });
 
-app.delete(["/api/posts", "/api/posts/"], (req, res) => {
-  db.prepare("DELETE FROM posts").run();
-  res.json({ message: "All posts deleted" });
+app.delete(["/api/posts", "/api/posts/"], async (req, res) => {
+  try {
+    if (isPostgres) {
+      await db.query("DELETE FROM posts");
+    } else {
+      db.prepare("DELETE FROM posts").run();
+    }
+    res.json({ message: "All posts deleted" });
+  } catch (error: any) {
+    res.status(500).json({ message: error.message });
+  }
 });
 
-app.delete(["/api/posts/:id", "/api/posts/:id/"], (req, res) => {
-  db.prepare("DELETE FROM posts WHERE id = ?").run(req.params.id);
-  res.json({ message: "Post deleted" });
+app.delete(["/api/posts/:id", "/api/posts/:id/"], async (req, res) => {
+  try {
+    if (isPostgres) {
+      await db.query("DELETE FROM posts WHERE id = $1", [req.params.id]);
+    } else {
+      db.prepare("DELETE FROM posts WHERE id = ?").run(req.params.id);
+    }
+    res.json({ message: "Post deleted" });
+  } catch (error: any) {
+    res.status(500).json({ message: error.message });
+  }
 });
 
-app.patch(["/api/posts/:id", "/api/posts/:id/"], (req, res) => {
+app.patch(["/api/posts/:id", "/api/posts/:id/"], async (req, res) => {
   const { id } = req.params;
   const { image_url } = req.body;
-  db.prepare("UPDATE posts SET image_url = ? WHERE id = ?").run(image_url, id);
-  res.json({ message: "Post updated" });
+  try {
+    if (isPostgres) {
+      await db.query("UPDATE posts SET image_url = $1 WHERE id = $2", [image_url, id]);
+    } else {
+      db.prepare("UPDATE posts SET image_url = ? WHERE id = ?").run(image_url, id);
+    }
+    res.json({ message: "Post updated" });
+  } catch (error: any) {
+    res.status(500).json({ message: error.message });
+  }
 });
 
 // Proxy image route to bypass Weibo hotlinking protection

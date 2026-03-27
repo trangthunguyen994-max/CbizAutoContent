@@ -390,7 +390,7 @@ export default function App() {
 
       {/* Footer Info */}
       <footer className="max-w-5xl mx-auto p-6 text-center text-gray-400 text-xs border-t border-gray-100 mt-10">
-        <p>© 2026 Cbiz Auto Content Tool • Powered by Miang994</p>
+        <p>© 2026 Cbiz Auto Content Tool • Powered by  Miang994 </p>
       </footer>
     </div>
   );
