@@ -52,9 +52,14 @@ let isPostgres = false;
 
 if (databaseUrl) {
   console.log("Using PostgreSQL (Supabase/Cloud)...");
+  if (databaseUrl.includes("supabase.co") && !databaseUrl.includes("pooler")) {
+    console.warn("HINT: You are using a direct Supabase connection URL. If you see 'ENETUNREACH' on Render, please use the 'Pooler' URL from Supabase Settings > Database.");
+  }
   db = new Pool({
     connectionString: databaseUrl,
-    ssl: { rejectUnauthorized: false } // Required for Supabase/Render
+    ssl: { rejectUnauthorized: false }, // Required for Supabase/Render
+    connectionTimeoutMillis: 10000, // 10s timeout
+    max: 10, // Limit pool size for PgBouncer
   });
   isPostgres = true;
 } else {
@@ -69,7 +74,7 @@ if (!process.env.NVIDIA_API_KEY) {
   console.warn("WARNING: NVIDIA_API_KEY is missing. AI translation and rewriting will be disabled.");
 }
 
-const initDb = async (retries = 3) => {
+const initDb = async (retries = 5) => {
   for (let i = 0; i < retries; i++) {
     try {
       if (isPostgres) {
@@ -103,7 +108,7 @@ const initDb = async (retries = 3) => {
     } catch (err: any) {
       console.error(`Database initialization failed (Attempt ${i + 1}/${retries}):`, err.message);
       if (i === retries - 1) throw err;
-      await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2s before retry
+      await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s before retry
     }
   }
 };
@@ -155,6 +160,8 @@ app.get(["/api/crawl", "/api/crawl/"], async (req, res) => {
       containerId = "106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Dsocial";
     } else if (category === "life") {
       containerId = "106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Dnews";
+    } else if (category === "minhtinh") {
+      containerId = "106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Dstar";
     }
 
     const primaryUrl = `https://m.weibo.cn/api/container/getIndex?containerid=${containerId}`;
@@ -358,6 +365,7 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
     let rawContent = "";
     let mblogId = "";
     let images: string[] = [];
+    let hasVideo = false;
 
     // 1. Thử trích xuất mblogid trực tiếp từ scheme (Cách chính xác nhất)
     if (scheme) {
@@ -384,6 +392,9 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
         if (response.data && response.data.data) {
           const postData = response.data.data;
           rawContent = postData.longText?.content || postData.text || "";
+          
+          // Detect video
+          hasVideo = !!(postData.page_info?.type === 'video' || postData.mix_media);
           
           // Extract images from direct API
           if (postData.pics) {
@@ -812,6 +823,49 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
 
     if (rawContent) {
       rawContent = rawContent.replace(/<br \/>/g, "\n").replace(/<[^>]*>/g, "").trim();
+      
+      // AI Rewriting
+      try {
+        const apiKey = process.env.NVIDIA_API_KEY;
+        if (apiKey && rawContent.length > 30) {
+          console.log("Rewriting content with AI...");
+          
+          let systemPrompt = "Bạn là một biên tập viên chuyên về tin tức giải trí Hoa Ngữ. Hãy viết lại nội dung sau sang tiếng Việt một cách hấp dẫn, lôi cuốn, phù hợp để đăng lên Facebook. Sử dụng âm Hán Việt cho tên riêng. Giữ nguyên các thông tin quan trọng. Dùng tối đa 2 emoji.";
+          
+          let userPrompt = `Viết lại nội dung Weibo sau sang tiếng Việt: "${rawContent}"`;
+          
+          if (hasVideo && scheme) {
+            const originalUrl = scheme.startsWith('http') ? scheme : `https://m.weibo.cn/detail/${mblogId || ''}`;
+            userPrompt += `\n\nLưu ý quan trọng: Bài đăng này có video, hãy thêm dòng "Link bài viết gốc có video: ${originalUrl}" vào cuối bài viết.`;
+          }
+
+          const rewritePromise = nvidia.chat.completions.create({
+            model: "moonshotai/kimi-k2.5",
+            messages: [
+              {
+                role: "system",
+                content: systemPrompt
+              },
+              {
+                role: "user",
+                content: userPrompt
+              }
+            ]
+          });
+
+          const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error("Rewrite timeout")), 25000)
+          );
+
+          const aiResponse = await Promise.race([rewritePromise, timeoutPromise]) as any;
+          if (aiResponse && aiResponse.choices[0]?.message?.content) {
+            rawContent = aiResponse.choices[0].message.content.trim();
+            console.log("AI Rewrite successful.");
+          }
+        }
+      } catch (aiErr: any) {
+        console.error("AI Rewrite failed:", aiErr.message);
+      }
     }
 
     const content = rawContent || "";
@@ -968,8 +1022,11 @@ async function startServer() {
     });
   } catch (err: any) {
     if (err.message && err.message.includes("ENETUNREACH")) {
-      console.error("CRITICAL: Failed to connect to database (ENETUNREACH). This often happens when trying to connect to a Supabase IPv6 address from an environment that only supports IPv4.");
-      console.error("HINT: Try using the IPv4-only connection string from Supabase (usually available in their settings) or add '?sslmode=require' to your DATABASE_URL.");
+      console.error("CRITICAL: Failed to connect to database (ENETUNREACH). This is a network issue, usually because your environment (like Render) doesn't support IPv6, but your database (Supabase) is using an IPv6-only address.");
+      console.error("SOLUTION: Go to Supabase Settings > Database > Connection string > Pooler. Use the 'Transaction' or 'Session' mode URL instead of the direct one. The hostname should look like '...pooler.supabase.com'.");
+    } else if (err.message && err.message.includes("Authentication query failed")) {
+      console.error("CRITICAL: Supabase Pooler Authentication Error. This usually means your Supabase project is PAUSED or the PASSWORD in your DATABASE_URL is incorrect.");
+      console.error("SOLUTION: 1. Check if your Supabase project is active (not paused). 2. Verify your database password in the connection string. 3. If you just unpaused the project, wait 1-2 minutes for the database to fully start.");
     }
     console.error("CRITICAL: Failed to start server:", err);
     process.exit(1);
