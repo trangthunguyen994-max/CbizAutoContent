@@ -4,6 +4,12 @@ import path from "path";
 import Database from "better-sqlite3";
 import { Pool } from "pg";
 import cors from "cors";
+import dns from "dns";
+
+// Force IPv4 first to avoid ENETUNREACH on IPv6-only hostnames in some environments
+if (typeof dns.setDefaultResultOrder === 'function') {
+  dns.setDefaultResultOrder("ipv4first");
+}
 
 import axios from "axios";
 import OpenAI from "openai";
@@ -63,38 +69,42 @@ if (!process.env.NVIDIA_API_KEY) {
   console.warn("WARNING: NVIDIA_API_KEY is missing. AI translation and rewriting will be disabled.");
 }
 
-const initDb = async () => {
-  try {
-    if (isPostgres) {
-      console.log("Initializing PostgreSQL tables...");
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS posts (
-          id SERIAL PRIMARY KEY,
-          original_title TEXT UNIQUE,
-          rewritten_content TEXT,
-          image_url TEXT,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          status TEXT DEFAULT 'pending'
-        )
-      `);
-      console.log("PostgreSQL tables initialized.");
-    } else {
-      console.log("Initializing SQLite tables...");
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS posts (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          original_title TEXT UNIQUE,
-          rewritten_content TEXT,
-          image_url TEXT,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          status TEXT DEFAULT 'pending'
-        )
-      `);
-      console.log("SQLite tables initialized.");
+const initDb = async (retries = 3) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      if (isPostgres) {
+        console.log(`Initializing PostgreSQL tables (Attempt ${i + 1}/${retries})...`);
+        await db.query(`
+          CREATE TABLE IF NOT EXISTS posts (
+            id SERIAL PRIMARY KEY,
+            original_title TEXT UNIQUE,
+            rewritten_content TEXT,
+            image_url TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'pending'
+          )
+        `);
+        console.log("PostgreSQL tables initialized.");
+      } else {
+        console.log("Initializing SQLite tables...");
+        db.exec(`
+          CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            original_title TEXT UNIQUE,
+            rewritten_content TEXT,
+            image_url TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'pending'
+          )
+        `);
+        console.log("SQLite tables initialized.");
+      }
+      return; // Success
+    } catch (err: any) {
+      console.error(`Database initialization failed (Attempt ${i + 1}/${retries}):`, err.message);
+      if (i === retries - 1) throw err;
+      await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2s before retry
     }
-  } catch (err) {
-    console.error("CRITICAL: Database initialization failed!", err);
-    throw err;
   }
 };
 
@@ -956,7 +966,11 @@ async function startServer() {
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`Server running on http://localhost:${PORT}`);
     });
-  } catch (err) {
+  } catch (err: any) {
+    if (err.message && err.message.includes("ENETUNREACH")) {
+      console.error("CRITICAL: Failed to connect to database (ENETUNREACH). This often happens when trying to connect to a Supabase IPv6 address from an environment that only supports IPv4.");
+      console.error("HINT: Try using the IPv4-only connection string from Supabase (usually available in their settings) or add '?sslmode=require' to your DATABASE_URL.");
+    }
     console.error("CRITICAL: Failed to start server:", err);
     process.exit(1);
   }
