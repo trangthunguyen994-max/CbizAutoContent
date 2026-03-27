@@ -1,14 +1,16 @@
 version: '3.8'
 
 services:
-  app:
+  weibo-crawler:
     build: .
-    container_name: cbiz-auto-content
+    container_name: weibo-crawler-app
     ports:
-      - "3001:3000" # Map cổng 3001 trên máy thật vào cổng 3000 của container
-    environment:
-      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
-      - NODE_ENV=production
+      - "3001:3000"
+    env_file:
+      - .env
     volumes:
-      - ./data:/app/data # Lưu trữ database SQLite để không bị mất dữ liệu khi restart
+      - ./data:/app/data
+    environment:
+      - NODE_ENV=production
+      - DATABASE_PATH=/app/data/posts.db
     restart: always

@@ -37,7 +37,8 @@ const nvidia = new OpenAI({
 });
 
 // Initialize Database
-const db = new Database("cbiz_content.db");
+const dbPath = process.env.DATABASE_PATH || "cbiz_content.db";
+const db = new Database(dbPath);
 db.exec(`
   CREATE TABLE IF NOT EXISTS posts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
