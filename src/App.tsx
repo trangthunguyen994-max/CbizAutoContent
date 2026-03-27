@@ -305,7 +305,7 @@ export default function App() {
                           onClick={() => {
                             const images = post.image_url ? JSON.parse(post.image_url) : [];
                             const imageNote = images.length > 0 ? `\n(Lưu ý: Bài gốc có ${images.length} ảnh, hãy tải về và đăng kèm bài viết).` : '';
-                            const prompt = `Dịch tiêu đề và nội dung Weibo sau thành một bài đăng Facebook tiếng Việt hấp dẫn.\n\nYêu cầu:\n1. Phong cách: Drama, hóng hớt, lôi cuốn (kiểu các page tin tức Cbiz).\n2. Tên người Trung Quốc: BẮT BUỘC dịch sang âm Hán Việt (ví dụ: 赵露思 -> Triệu Lộ Tư).\n3. Cấu trúc: Tiêu đề gây sốc + Nội dung tóm tắt hấp dẫn + Hashtag liên quan.${imageNote}\n\nTiêu đề: ${post.original_title}\nNội dung: ${post.rewritten_content}`;
+                            const prompt = `Dịch tiêu đề và nội dung Weibo sau thành một bài đăng Facebook tiếng Việt hấp dẫn.\n\nYêu cầu:\n1. Phong cách: Casual, hóng hớt, lôi cuốn (kiểu các page tin tức Cbiz).\n2. Tên người Trung Quốc: BẮT BUỘC dịch sang âm Hán Việt (ví dụ: 赵露思 -> Triệu Lộ Tư).\n3. Yêu cầu: Dùng tối đa 2 emoji, tránh dùng quá nhiều từ mạnh.\n4. Cấu trúc: Tiêu đề gây sốc + Nội dung tóm tắt hấp dẫn + Hashtag liên quan.\n\nTiêu đề: ${post.original_title}\nNội dung: ${post.rewritten_content}`;
                             copyToClipboard(prompt, post.id + 10000);
                           }}
                           className={`flex items-center gap-2 px-3 py-2 rounded-xl font-bold text-xs transition-all ${
