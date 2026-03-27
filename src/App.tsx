@@ -24,12 +24,15 @@ export default function App() {
     setLoading(true);
     try {
       const res = await fetch('/api/posts');
-      if (!res.ok) throw new Error('Failed to fetch posts');
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.message || `HTTP ${res.status}`);
+      }
       const data = await res.json();
       setPosts(data);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to fetch posts', err);
-      setError('Không thể tải danh sách bài viết.');
+      setError(`Không thể tải danh sách bài viết: ${err.message}`);
     } finally {
       setLoading(false);
     }
@@ -88,7 +91,7 @@ export default function App() {
 
       // Step 1: Fetch latest hot topics from our backend (which crawls Weibo Mobile)
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout
+      const timeoutId = setTimeout(() => controller.abort(), 120000); // 120s timeout
       
       const response = await fetch(`/api/crawl?category=${category}`, {
         signal: controller.signal
@@ -158,7 +161,11 @@ export default function App() {
       await fetchPosts();
     } catch (err: any) {
       console.error('Crawl failed', err);
-      setError(`Lỗi hệ thống: ${err.message || 'Không xác định'}`);
+      let msg = err.message || 'Không xác định';
+      if (err.name === 'AbortError' || msg.includes('aborted')) {
+        msg = "Quá trình lấy tin tốn quá nhiều thời gian (Timeout). Vui lòng thử lại sau.";
+      }
+      setError(`Lỗi hệ thống: ${msg}`);
     } finally {
       setCrawling(false);
     }
@@ -390,7 +397,7 @@ export default function App() {
 
       {/* Footer Info */}
       <footer className="max-w-5xl mx-auto p-6 text-center text-gray-400 text-xs border-t border-gray-100 mt-10">
-        <p>© 2026 Cbiz Auto Content Tool • Powered by  Miang994 </p>
+        <p>© 2026 Cbiz Auto Content Tool • Powered by Miang994</p>
       </footer>
     </div>
   );

@@ -52,37 +52,53 @@ if (databaseUrl) {
   });
   isPostgres = true;
 } else {
+  if (process.env.RENDER) {
+    console.warn("WARNING: Running on Render but DATABASE_URL is missing. SQLite will be used, but data will be lost on restart.");
+  }
   console.log("Using SQLite (Local)...");
   db = new Database(dbPath);
 }
 
+if (!process.env.NVIDIA_API_KEY) {
+  console.warn("WARNING: NVIDIA_API_KEY is missing. AI translation and rewriting will be disabled.");
+}
+
 const initDb = async () => {
-  if (isPostgres) {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS posts (
-        id SERIAL PRIMARY KEY,
-        original_title TEXT UNIQUE,
-        rewritten_content TEXT,
-        image_url TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        status TEXT DEFAULT 'pending'
-      )
-    `);
-  } else {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS posts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        original_title TEXT UNIQUE,
-        rewritten_content TEXT,
-        image_url TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        status TEXT DEFAULT 'pending'
-      )
-    `);
+  try {
+    if (isPostgres) {
+      console.log("Initializing PostgreSQL tables...");
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS posts (
+          id SERIAL PRIMARY KEY,
+          original_title TEXT UNIQUE,
+          rewritten_content TEXT,
+          image_url TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          status TEXT DEFAULT 'pending'
+        )
+      `);
+      console.log("PostgreSQL tables initialized.");
+    } else {
+      console.log("Initializing SQLite tables...");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS posts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          original_title TEXT UNIQUE,
+          rewritten_content TEXT,
+          image_url TEXT,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          status TEXT DEFAULT 'pending'
+        )
+      `);
+      console.log("SQLite tables initialized.");
+    }
+  } catch (err) {
+    console.error("CRITICAL: Database initialization failed!", err);
+    throw err;
   }
 };
 
-initDb().catch(err => console.error("Database init error:", err));
+// initDb().catch(err => console.error("Database init error:", err));
 
 const app = express();
 app.use(express.json());
@@ -91,10 +107,14 @@ app.use(cors());
 const PORT = 3000;
 
 // API Routes
-app.get("/api/health", (req, res) => {
+app.get("/api/health", async (req, res) => {
   let dbStatus = "ok";
   try {
-    db.prepare("SELECT 1").get();
+    if (isPostgres) {
+      await db.query("SELECT 1");
+    } else {
+      db.prepare("SELECT 1").get();
+    }
   } catch (e) {
     dbStatus = "failed: " + (e as Error).message;
   }
@@ -103,7 +123,8 @@ app.get("/api/health", (req, res) => {
     status: "ok", 
     time: new Date().toISOString(),
     puppeteer: puppeteerStatus,
-    database: dbStatus
+    database: dbStatus,
+    mode: isPostgres ? "PostgreSQL" : "SQLite"
   });
 });
 
@@ -115,77 +136,126 @@ app.get(["/api/crawl", "/api/crawl/"], async (req, res) => {
     
     let topics: any[] = [];
 
-    // 1. Primary Source: Puppeteer Scraper for s.weibo.com (Most reliable for categories)
-    console.log("Starting Puppeteer for s.weibo.com Hot Search...");
-    let browser;
-    try {
-      browser = await puppeteer.launch({
-        headless: true,
-        args: [
-          "--no-sandbox", 
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-gpu"
-        ],
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
-      });
-      const page = await browser.newPage();
-      
-      // Use Desktop Hot Search page
-      let hotSearchUrl = "https://s.weibo.com/top/summary";
-      if (category === "entertainment") {
-        hotSearchUrl = "https://s.weibo.com/top/summary?cate=entrank";
-      } else if (category === "social") {
-        hotSearchUrl = "https://s.weibo.com/top/summary?cate=socialevent";
-      } else if (category === "realtime") {
-        hotSearchUrl = "https://s.weibo.com/top/summary?cate=realtimehot";
-      } else if (category === "life") {
-        hotSearchUrl = "https://s.weibo.com/top/summary?cate=life";
-      }
-
-      console.log(`Puppeteer navigating to: ${hotSearchUrl}`);
-      await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-      await page.goto(hotSearchUrl, { waitUntil: "networkidle2", timeout: 30000 });
-      
-      // Wait for the table to load
-      await page.waitForSelector(".td-02", { timeout: 10000 }).catch(() => console.log("Timeout waiting for .td-02"));
-
-      const scrapedTopics = await page.evaluate(() => {
-        const items: any[] = [];
-        const rows = document.querySelectorAll("tr");
-        rows.forEach(row => {
-          const titleEl = row.querySelector(".td-02 a");
-          const rankEl = row.querySelector(".td-01");
-          const iconEl = row.querySelector(".td-03");
-          
-          if (titleEl) {
-            const title = titleEl.textContent?.trim() || "";
-            const href = titleEl.getAttribute("href") || "";
-            const isTop = rankEl?.textContent?.includes("置顶") || iconEl?.textContent?.includes("荐");
-            
-            if (title && !isTop) {
-              items.push({
-                title: title,
-                query: title,
-                scheme: href.startsWith("http") ? href : `https://s.weibo.com${href}`
-              });
-            }
-          }
-        });
-        return items;
-      });
-      
-      if (scrapedTopics.length > 0) {
-        topics = scrapedTopics;
-        console.log(`Puppeteer (s.weibo.com) successfully scraped ${topics.length} topics.`);
-      }
-    } catch (err: any) {
-      console.error("Puppeteer s.weibo.com scrape failed:", err.message);
-    } finally {
-      if (browser) await browser.close();
+    // 1. Primary Source: Weibo Direct APIs (Axios) - Fastest and most reliable for lists
+    console.log("Trying Weibo Direct APIs (Axios) for Hot Search...");
+    let containerId = "106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Drealtime";
+    if (category === "entertainment") {
+      containerId = "106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Dent";
+    } else if (category === "social") {
+      containerId = "106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Dsocial";
+    } else if (category === "life") {
+      containerId = "106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Dnews";
     }
 
-    // 2. Secondary Source: Puppeteer Scraper for TopHub (Fallback)
+    const primaryUrl = `https://m.weibo.cn/api/container/getIndex?containerid=${containerId}`;
+    
+    try {
+      const response = await axios.get(primaryUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+          "Referer": "https://m.weibo.cn/",
+          "X-Requested-With": "XMLHttpRequest"
+        },
+        timeout: 10000
+      });
+      
+      if (response.data && response.data.data && response.data.data.cards) {
+        for (const card of response.data.data.cards) {
+          const group = card.card_group || card.group || (card.card_type === 11 ? [card] : []);
+          if (Array.isArray(group)) {
+            for (const item of group) {
+              const title = item.desc || item.word || item.desc1 || item.title_sub;
+              if (title && !String(title).includes("置顶")) {
+                topics.push({
+                  title: String(title).replace(/<[^>]*>/g, "").trim(),
+                  query: String(title).trim(),
+                  scheme: item.scheme || ""
+                });
+              }
+            }
+          }
+        }
+      }
+      if (topics.length > 0) {
+        console.log(`Axios Weibo API successfully fetched ${topics.length} topics.`);
+      }
+    } catch (err: any) {
+      console.error("Axios Weibo API failed:", err.message);
+    }
+
+    // 2. Secondary Source: Puppeteer Scraper for s.weibo.com (Fallback)
+    if (topics.length === 0) {
+      console.log("Axios failed, starting Puppeteer for s.weibo.com Hot Search...");
+      let browser;
+      try {
+        browser = await puppeteer.launch({
+          headless: true,
+          args: [
+            "--no-sandbox", 
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu"
+          ],
+          executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
+        });
+        const page = await browser.newPage();
+        
+        // Use Desktop Hot Search page
+        let hotSearchUrl = "https://s.weibo.com/top/summary";
+        if (category === "entertainment") {
+          hotSearchUrl = "https://s.weibo.com/top/summary?cate=entrank";
+        } else if (category === "social") {
+          hotSearchUrl = "https://s.weibo.com/top/summary?cate=socialevent";
+        } else if (category === "realtime") {
+          hotSearchUrl = "https://s.weibo.com/top/summary?cate=realtimehot";
+        } else if (category === "life") {
+          hotSearchUrl = "https://s.weibo.com/top/summary?cate=life";
+        }
+
+        console.log(`Puppeteer navigating to: ${hotSearchUrl}`);
+        await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        await page.goto(hotSearchUrl, { waitUntil: "networkidle2", timeout: 30000 });
+        
+        // Wait for the table to load
+        await page.waitForSelector(".td-02", { timeout: 10000 }).catch(() => console.log("Timeout waiting for .td-02"));
+
+        const scrapedTopics = await page.evaluate(() => {
+          const items: any[] = [];
+          const rows = document.querySelectorAll("tr");
+          rows.forEach(row => {
+            const titleEl = row.querySelector(".td-02 a");
+            const rankEl = row.querySelector(".td-01");
+            const iconEl = row.querySelector(".td-03");
+            
+            if (titleEl) {
+              const title = titleEl.textContent?.trim() || "";
+              const href = titleEl.getAttribute("href") || "";
+              const isTop = rankEl?.textContent?.includes("置顶") || iconEl?.textContent?.includes("荐");
+              
+              if (title && !isTop) {
+                items.push({
+                  title: title,
+                  query: title,
+                  scheme: href.startsWith("http") ? href : `https://s.weibo.com${href}`
+                });
+              }
+            }
+          });
+          return items;
+        });
+        
+        if (scrapedTopics.length > 0) {
+          topics = scrapedTopics;
+          console.log(`Puppeteer (s.weibo.com) successfully scraped ${topics.length} topics.`);
+        }
+      } catch (err: any) {
+        console.error("Puppeteer s.weibo.com scrape failed:", err.message);
+      } finally {
+        if (browser) await browser.close();
+      }
+    }
+
+    // 3. Last Resort: Puppeteer Scraper for TopHub (Fallback)
     if (topics.length === 0) {
       console.log("s.weibo.com failed, trying TopHub via Puppeteer...");
       let browser;
@@ -241,51 +311,9 @@ app.get(["/api/crawl", "/api/crawl/"], async (req, res) => {
       }
     }
 
-    // 3. Last Resort: Weibo Direct APIs (Axios)
+    // 4. Final Fallback: Weibo Direct APIs (Already tried as #1, but keeping logic for structure)
     if (topics.length === 0) {
-      console.log("Puppeteer sources failed, trying Weibo Direct APIs (Axios)...");
-      
-      let containerId = "106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Drealtime";
-      if (category === "entertainment") {
-        containerId = "106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Dent";
-      } else if (category === "social") {
-        containerId = "106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Dsocial";
-      } else if (category === "life") {
-        containerId = "106003type%3D25%26t%3D3%26disable_hot%3D1%26filter_type%3Dnews";
-      }
-
-      const primaryUrl = `https://m.weibo.cn/api/container/getIndex?containerid=${containerId}`;
-      
-      try {
-        const response = await axios.get(primaryUrl, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-            "Referer": "https://m.weibo.cn/",
-            "X-Requested-With": "XMLHttpRequest"
-          },
-          timeout: 10000
-        });
-        
-        if (response.data && response.data.data && response.data.data.cards) {
-          for (const card of response.data.data.cards) {
-            const group = card.card_group || card.group || (card.card_type === 11 ? [card] : []);
-            if (Array.isArray(group)) {
-              for (const item of group) {
-                const title = item.desc || item.word || item.desc1 || item.title_sub;
-                if (title && !String(title).includes("置顶")) {
-                  topics.push({
-                    title: String(title).replace(/<[^>]*>/g, "").trim(),
-                    query: String(title).trim(),
-                    scheme: item.scheme || ""
-                  });
-                }
-              }
-            }
-          }
-        }
-      } catch (err: any) {
-        console.error("Axios Weibo API failed:", err.message);
-      }
+      console.log("All sources failed.");
     }
 
     if (topics.length === 0) {
@@ -303,52 +331,9 @@ app.get(["/api/crawl", "/api/crawl/"], async (req, res) => {
 
     const topTopics = uniqueTopics.slice(0, 5);
 
-    // Translate titles to Vietnamese (Hán Việt for names)
-    /*
-    console.log(`Translating ${topTopics.length} titles...`);
-    const translatedTopics = await Promise.all(topTopics.map(async (topic) => {
-      try {
-        const apiKey = process.env.NVIDIA_API_KEY;
-        if (!apiKey) {
-          console.warn("NVIDIA_API_KEY not found, skipping translation.");
-          return { ...topic, originalTitle: topic.title };
-        }
-
-        // Add a timeout to the translation call
-        const translationPromise = nvidia.chat.completions.create({
-          model: "moonshotai/kimi-k2.5",
-          messages: [
-            {
-              role: "system",
-              content: "You are a professional translator specializing in Chinese-to-Vietnamese translation for entertainment news. Use Hán-Việt for Chinese names."
-            },
-            {
-              role: "user",
-              content: `Dịch tiêu đề Weibo sau sang tiếng Việt. Lưu ý: Tên người Trung Quốc PHẢI dịch sang âm Hán Việt (ví dụ: 赵露思 -> Triệu Lộ Tư, 肖战 -> Tiêu Chiến). Chỉ trả về nội dung đã dịch, không thêm giải thích, không để trong ngoặc kép. Tiêu đề: "${topic.title}"`
-            }
-          ]
-        });
-
-        // 10 second timeout for translation
-        const timeoutPromise = new Promise((_, reject) => 
-          setTimeout(() => reject(new Error("Translation timeout")), 10000)
-        );
-
-        const response = await Promise.race([translationPromise, timeoutPromise]) as any;
-        
-        const translatedTitle = response.choices[0]?.message?.content?.trim() || topic.title;
-        console.log(`Translated: "${topic.title}" -> "${translatedTitle}"`);
-        return { ...topic, originalTitle: topic.title, title: translatedTitle.replace(/^"|"$/g, '') };
-      } catch (err: any) {
-        console.error(`Translation error for topic "${topic.title}":`, err.message);
-        return { ...topic, originalTitle: topic.title };
-      }
-    }));
-    */
-
-    const translatedTopics = topTopics.map(t => ({ ...t, originalTitle: t.title }));
-
-    res.json(translatedTopics);
+    // Return original topics without translation
+    const finalTopics = topTopics.map(t => ({ ...t, originalTitle: t.title }));
+    res.json(finalTopics);
   } catch (error: any) {
     console.error("Crawl error:", error.message);
     res.status(500).json({ message: "Lỗi hệ thống khi crawl Weibo: " + error.message });
@@ -396,13 +381,63 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
           }
         }
       } catch (err: any) {
-        console.warn(`Direct fetch failed for ${mblogId}, falling back to Puppeteer...`);
+        console.warn(`Direct fetch failed for ${mblogId}, falling back to search...`);
       }
     }
 
-    // 3. Sử dụng Puppeteer để lấy nội dung (Phương án mạnh mẽ nhất)
+    // 3. Sử dụng Axios API search (Nhanh và ổn định hơn Puppeteer)
     if (!rawContent && query) {
-      console.log(`Starting Puppeteer for query: ${query}`);
+      console.log(`Trying Axios API search for query: ${query}`);
+      try {
+        const encodedQuery = encodeURIComponent(query).replace(/%20/g, "+");
+        const apiSearchUrl = `https://m.weibo.cn/api/container/getIndex?containerid=100103type%3D1%26q%3D${encodedQuery}`;
+        
+        const apiRes = await axios.get(apiSearchUrl, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+            "Referer": "https://m.weibo.cn/",
+            "X-Requested-With": "XMLHttpRequest"
+          },
+          timeout: 10000
+        });
+
+        if (apiRes.data && apiRes.data.data && apiRes.data.data.cards) {
+          const findContentInCards = (cards: any[]): any => {
+            for (const card of cards) {
+              const group = card.card_group || card.group || (card.card_type === 11 ? [card] : []);
+              if (Array.isArray(group)) {
+                for (const item of group) {
+                  if (item.mblog) {
+                    return {
+                      text: item.mblog.longText?.content || item.mblog.text || "",
+                      pics: item.mblog.pics?.map((p: any) => p.large?.url || p.url) || []
+                    };
+                  }
+                }
+              } else if (card.mblog) {
+                return {
+                  text: card.mblog.longText?.content || card.mblog.text || "",
+                  pics: card.mblog.pics?.map((p: any) => p.large?.url || p.url) || []
+                };
+              }
+            }
+            return null;
+          };
+          const res = findContentInCards(apiRes.data.data.cards);
+          if (res) {
+            rawContent = res.text;
+            images = res.pics || [];
+            console.log(`Axios API Search: Found content and ${images.length} images`);
+          }
+        }
+      } catch (err: any) {
+        console.warn("Axios API search failed:", err.message);
+      }
+    }
+
+    // 4. Sử dụng Puppeteer để lấy nội dung (Phương án dự phòng cuối cùng)
+    if (!rawContent && query) {
+      console.log(`Starting Puppeteer fallback for query: ${query}`);
       let browser;
       try {
         browser = await puppeteer.launch({
@@ -899,6 +934,9 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 
 async function startServer() {
   try {
+    // Ensure database is initialized before starting server
+    await initDb();
+    
     if (process.env.NODE_ENV !== "production") {
       console.log("Starting Vite in middleware mode...");
       const vite = await createViteServer({
@@ -919,7 +957,7 @@ async function startServer() {
       console.log(`Server running on http://localhost:${PORT}`);
     });
   } catch (err) {
-    console.error("Failed to start server:", err);
+    console.error("CRITICAL: Failed to start server:", err);
     process.exit(1);
   }
 }
