@@ -360,7 +360,7 @@ app.get(["/api/crawl", "/api/crawl/"], async (req, res) => {
       return res.status(404).json({ message: "Không tìm thấy tin nào từ Weibo Mobile" });
     }
 
-    const topTopics = uniqueTopics.slice(0, 5);
+    const topTopics = uniqueTopics.slice(0, 2);
 
     // Return original topics without translation
     const finalTopics = topTopics.map(t => ({ ...t, originalTitle: t.title }));
@@ -372,7 +372,8 @@ app.get(["/api/crawl", "/api/crawl/"], async (req, res) => {
 });
 
 app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
-  const { title, query, scheme } = req.body;
+  const { title, query: reqQuery, scheme } = req.body;
+  const query = reqQuery || title;
   if (!title && !query) return res.status(400).json({ message: "Title or Query is required" });
 
   try {
@@ -383,7 +384,9 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
 
     // 1. Thử trích xuất mblogid trực tiếp từ scheme (Cách chính xác nhất)
     if (scheme) {
-      const idMatch = scheme.match(/mblogid=([A-Za-z0-9]+)/) || scheme.match(/status\/([A-Za-z0-9]+)/);
+      const idMatch = scheme.match(/mblogid=([A-Za-z0-9]+)/) || 
+                      scheme.match(/status\/([A-Za-z0-9]+)/) ||
+                      scheme.match(/detail\/([A-Za-z0-9]+)/);
       if (idMatch) {
         mblogId = idMatch[1];
       }
@@ -443,17 +446,25 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
               if (Array.isArray(group)) {
                 for (const item of group) {
                   if (item.mblog) {
-                    return {
-                      text: item.mblog.longText?.content || item.mblog.text || "",
-                      pics: item.mblog.pics?.map((p: any) => p.large?.url || p.url) || []
-                    };
+                    const text = item.mblog.longText?.content || item.mblog.text || "";
+                    if (text.length > 20) {
+                      return {
+                        text,
+                        pics: item.mblog.pics?.map((p: any) => p.large?.url || p.url) || [],
+                        hasVideo: !!(item.mblog.page_info?.type === 'video' || item.mblog.mix_media)
+                      };
+                    }
                   }
                 }
               } else if (card.mblog) {
-                return {
-                  text: card.mblog.longText?.content || card.mblog.text || "",
-                  pics: card.mblog.pics?.map((p: any) => p.large?.url || p.url) || []
-                };
+                const text = card.mblog.longText?.content || card.mblog.text || "";
+                if (text.length > 20) {
+                  return {
+                    text,
+                    pics: card.mblog.pics?.map((p: any) => p.large?.url || p.url) || [],
+                    hasVideo: !!(card.mblog.page_info?.type === 'video' || card.mblog.mix_media)
+                  };
+                }
               }
             }
             return null;
@@ -462,7 +473,8 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
           if (res) {
             rawContent = res.text;
             images = res.pics || [];
-            console.log(`Axios API Search: Found content and ${images.length} images`);
+            hasVideo = res.hasVideo || false;
+            console.log(`Axios API Search: Found content and ${images.length} images (Video: ${hasVideo})`);
           }
         }
       } catch (err: any) {
@@ -497,56 +509,113 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
         await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
 
         const encodedQuery = encodeURIComponent(query).replace(/%20/g, "+");
-        const containerId = `100103type=1&q=${encodedQuery}`;
-        const scrapingUrl = `https://m.weibo.cn/search?containerid=${encodeURIComponent(containerId)}`;
-
-        console.log(`Puppeteer navigating to: ${scrapingUrl}`);
         
-        // Đặt timeout dài hơn vì Weibo load khá chậm
-        await page.goto(scrapingUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-
-        // Đợi một chút để JS render hoàn toàn
-        await new Promise(r => setTimeout(r, 3000));
-
-        // 1. Thử lấy từ $render_data trong script (Cách sạch nhất)
-        const renderDataContent = await page.evaluate(() => {
+        // 0. Ưu tiên lấy trực tiếp nếu có mblogId
+        if (mblogId) {
+          const detailUrl = `https://m.weibo.cn/detail/${mblogId}`;
+          console.log(`Puppeteer: Found mblogId ${mblogId}, fetching directly: ${detailUrl}`);
           try {
-            // @ts-ignore
-            const data = window.$render_data;
-            if (!data) return null;
-
-            const findContent = (obj: any): any => {
-              if (!obj) return null;
-              if (obj.mblog) {
+            await page.goto(detailUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+            await new Promise(r => setTimeout(r, 2000));
+            
+            const detailResult = await page.evaluate(() => {
+              // @ts-ignore
+              const renderData = window.$render_data;
+              if (renderData && renderData.status) {
+                const status = renderData.status;
                 return {
-                  text: obj.mblog.longText?.content || obj.mblog.text || "",
-                  pics: obj.mblog.pics?.map((p: any) => p.large?.url || p.url) || []
+                  text: status.longText?.content || status.text || "",
+                  pics: status.pics?.map((p: any) => p.large?.url || p.url) || [],
+                  hasVideo: !!(status.page_info?.type === 'video' || status.mix_media)
                 };
               }
-              if (Array.isArray(obj)) {
-                for (const item of obj) {
-                  const c = findContent(item);
-                  if (c) return c;
-                }
-              }
-              if (typeof obj === 'object') {
-                for (const key in obj) {
-                  const c = findContent(obj[key]);
-                  if (c) return c;
-                }
+              // Fallback to CSS
+              const el = document.querySelector(".weibo-text, .content, .txt");
+              if (el) {
+                const clones = el.cloneNode(true) as HTMLElement;
+                clones.querySelectorAll("a").forEach(a => {
+                  if (a.textContent?.includes("收起") || a.textContent?.includes("全文")) a.remove();
+                });
+                const text = clones.textContent?.trim() || "";
+                const pics: string[] = [];
+                document.querySelectorAll(".media-piclist img, .weibo-media img").forEach(img => {
+                  const src = img.getAttribute("src");
+                  if (src) pics.push(src.replace("/thumb180/", "/large/").replace("/orj360/", "/large/"));
+                });
+                const hasVideo = !!(document.querySelector(".video-tag") || document.querySelector(".weibo-video") || document.querySelector(".video-player") || document.querySelector(".m-video-tag") || document.querySelector(".icon-video") || document.querySelector(".media-video"));
+                return { text, pics, hasVideo };
               }
               return null;
-            };
-            return findContent(data);
-          } catch (e) {
-            return null;
-          }
-        });
+            });
 
-        if (renderDataContent) {
-          rawContent = renderDataContent.text;
-          images = renderDataContent.pics || [];
-          console.log(`Puppeteer: Found content and ${images.length} images in $render_data`);
+            if (detailResult && detailResult.text) {
+              rawContent = detailResult.text;
+              images = detailResult.pics || [];
+              hasVideo = detailResult.hasVideo || false;
+              console.log(`Puppeteer: Successfully fetched direct post (Video: ${hasVideo})`);
+            }
+          } catch (e) {
+            console.error(`Puppeteer: Direct fetch failed for ${mblogId}:`, e);
+          }
+        }
+
+        // 1. Tìm kiếm Mobile nếu chưa có content
+        if (!rawContent) {
+          const containerId = `100103type=1&q=${encodedQuery}`;
+          const scrapingUrl = `https://m.weibo.cn/search?containerid=${encodeURIComponent(containerId)}`;
+
+          console.log(`Puppeteer navigating to: ${scrapingUrl}`);
+          
+          // Đặt timeout dài hơn vì Weibo load khá chậm
+          await page.goto(scrapingUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+
+          // Đợi một chút để JS render hoàn toàn
+          await new Promise(r => setTimeout(r, 3000));
+        }
+
+        // 1. Thử lấy từ $render_data trong script (Cách sạch nhất)
+        if (!rawContent) {
+          const renderDataContent = await page.evaluate(() => {
+            try {
+              // @ts-ignore
+              const data = window.$render_data;
+              if (!data) return null;
+  
+              const findContent = (obj: any): any => {
+                if (!obj) return null;
+                if (obj.mblog) {
+                  return {
+                    text: obj.mblog.longText?.content || obj.mblog.text || "",
+                    pics: obj.mblog.pics?.map((p: any) => p.large?.url || p.url) || [],
+                    hasVideo: !!(obj.mblog.page_info?.type === 'video' || obj.mblog.mix_media)
+                  };
+                }
+                if (Array.isArray(obj)) {
+                  for (const item of obj) {
+                    const c = findContent(item);
+                    if (c) return c;
+                  }
+                }
+                if (typeof obj === 'object') {
+                  for (const key in obj) {
+                    const c = findContent(obj[key]);
+                    if (c) return c;
+                  }
+                }
+                return null;
+              };
+              return findContent(data);
+            } catch (e) {
+              return null;
+            }
+          });
+  
+          if (renderDataContent) {
+            rawContent = renderDataContent.text;
+            images = renderDataContent.pics || [];
+            hasVideo = renderDataContent.hasVideo || false;
+            console.log(`Puppeteer: Found content and ${images.length} images in $render_data (Video: ${hasVideo})`);
+          }
         }
 
         // 2. Nếu không thấy, thử lấy text từ các selector phổ biến
@@ -575,6 +644,8 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
                   });
                 });
 
+                const hasVideo = !!(el.querySelector(".video-tag") || el.querySelector(".weibo-video") || el.querySelector(".video-player") || el.querySelector(".m-video-tag"));
+                
                 // If no ul images found, try any img in the article that looks like a post image
                 if (pics.length === 0) {
                   const allImgs = el.querySelectorAll("img");
@@ -597,7 +668,7 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
                   }
                 }
                 
-                return { text, pics };
+                return { text, pics, hasVideo };
               }
             }
             return null;
@@ -616,6 +687,8 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
                 const article = document.querySelector("article") || document.querySelector(".weibo-main") || document.body;
                 const textEl = article.querySelector(".weibo-text") || article.querySelector(".content") || article.querySelector(".main-text") || article;
                 
+                const hasVideo = !!(article.querySelector(".video-tag") || article.querySelector(".weibo-video") || article.querySelector(".video-player") || article.querySelector(".m-video-tag"));
+
                 // Extract images from 'article ul'
                 const pics: string[] = [];
                 const mediaContainers = article.querySelectorAll("ul, .weibo-media, .weibo-media-wraps, .media-piclist");
@@ -645,16 +718,18 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
                 clone.querySelectorAll("a, .expand").forEach(e => e.remove());
                 const text = clone.textContent?.trim() || "";
                 
-                return { text, pics };
+                return { text, pics, hasVideo };
               });
 
               if (detailResult) {
                 rawContent = detailResult.text;
                 images = detailResult.pics || [];
+                hasVideo = detailResult.hasVideo || false;
               }
             } else if (extracted.text) {
               rawContent = extracted.text;
               images = extracted.pics || [];
+              hasVideo = extracted.hasVideo || false;
             }
           }
           
@@ -687,13 +762,15 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
                 });
               }
 
+              const hasVideo = !!(card?.querySelector(".video-tag") || card?.querySelector(".weibo-video") || card?.querySelector(".video-player") || card?.querySelector(".m-video-tag") || card?.querySelector(".icon-video") || card?.querySelector(".media-video"));
+
               // Loại bỏ 收起/全文
               const clones = el.cloneNode(true) as HTMLElement;
               clones.querySelectorAll("a").forEach(a => {
                 if (a.textContent?.includes("收起") || a.textContent?.includes("全文")) a.remove();
               });
               const text = clones.textContent?.trim() || "";
-              if (text.length > 30) return { text, pics };
+              if (text.length > 30) return { text, pics, hasVideo };
             }
             return null;
           });
@@ -701,7 +778,8 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
           if (desktopResult) {
             rawContent = desktopResult.text;
             images = desktopResult.pics || [];
-            console.log(`Puppeteer: Found content and ${images.length} images via Desktop Search`);
+            hasVideo = desktopResult.hasVideo || false;
+            console.log(`Puppeteer: Found content and ${images.length} images via Desktop Search (Video: ${hasVideo})`);
           }
         }
 
@@ -737,17 +815,25 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
               if (Array.isArray(group)) {
                 for (const item of group) {
                   if (item.mblog) {
-                    return {
-                      text: item.mblog.longText?.content || item.mblog.text || "",
-                      pics: item.mblog.pics?.map((p: any) => p.large?.url || p.url) || []
-                    };
+                    const text = item.mblog.longText?.content || item.mblog.text || "";
+                    if (text.length > 20) {
+                      return {
+                        text,
+                        pics: item.mblog.pics?.map((p: any) => p.large?.url || p.url) || [],
+                        hasVideo: !!(item.mblog.page_info?.type === 'video' || item.mblog.mix_media)
+                      };
+                    }
                   }
                 }
               } else if (card.mblog) {
-                return {
-                  text: card.mblog.longText?.content || card.mblog.text || "",
-                  pics: card.mblog.pics?.map((p: any) => p.large?.url || p.url) || []
-                };
+                const text = card.mblog.longText?.content || card.mblog.text || "";
+                if (text.length > 20) {
+                  return {
+                    text,
+                    pics: card.mblog.pics?.map((p: any) => p.large?.url || p.url) || [],
+                    hasVideo: !!(card.mblog.page_info?.type === 'video' || card.mblog.mix_media)
+                  };
+                }
               }
             }
             return null;
@@ -756,7 +842,8 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
           if (res) {
             rawContent = res.text;
             images = res.pics || [];
-            console.log(`Axios: Found content and ${images.length} images via API search`);
+            hasVideo = res.hasVideo || false;
+            console.log(`Axios: Found content and ${images.length} images via API search (Video: ${hasVideo})`);
           }
         }
 
@@ -787,9 +874,15 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
             if (match) {
               try {
                 const renderData = JSON.parse(match[1]);
-                const findContent = (obj: any): string => {
-                  if (!obj) return "";
-                  if (obj.mblog) return obj.mblog.longText?.content || obj.mblog.text || "";
+                const findContent = (obj: any): any => {
+                  if (!obj) return null;
+                  if (obj.mblog) {
+                    return {
+                      text: obj.mblog.longText?.content || obj.mblog.text || "",
+                      pics: obj.mblog.pics?.map((p: any) => p.large?.url || p.url) || [],
+                      hasVideo: !!(obj.mblog.page_info?.type === 'video' || obj.mblog.mix_media)
+                    };
+                  }
                   if (Array.isArray(obj)) {
                     for (const item of obj) {
                       const c = findContent(item);
@@ -802,10 +895,15 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
                       if (c) return c;
                     }
                   }
-                  return "";
+                  return null;
                 };
-                rawContent = findContent(renderData);
-                if (rawContent) break;
+                const res = findContent(renderData);
+                if (res) {
+                  rawContent = res.text;
+                  images = res.pics || [];
+                  hasVideo = res.hasVideo || false;
+                  break;
+                }
               } catch (e) {}
             }
           }
@@ -817,6 +915,7 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
               const text = textEl.text().trim();
               if (text.length > 30) {
                 rawContent = text;
+                hasVideo = !!($(article).find(".video-tag, .weibo-video, .video-player, .m-video-tag, .icon-video, .media-video").length > 0);
                 // Extract images from ul
                 $(article).find("ul img, .weibo-media img, .media-piclist img").each((j, img) => {
                   const src = $(img).attr("src");
@@ -844,7 +943,7 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
         if (apiKey && rawContent.length > 30) {
           console.log("Rewriting content with AI...");
           
-          let systemPrompt = "Bạn là một biên tập viên chuyên về tin tức giải trí Hoa Ngữ. Hãy viết lại nội dung sau sang tiếng Việt một cách hấp dẫn, lôi cuốn, phù hợp để đăng lên Facebook. Sử dụng âm Hán Việt cho tên riêng. Giữ nguyên các thông tin quan trọng. Dùng tối đa 2 emoji.";
+          let systemPrompt = "Bạn là một biên tập viên chuyên về tin tức giải trí Hoa Ngữ. Hãy viết lại nội dung sau sang tiếng Việt một cách hấp dẫn, lôi cuốn, phù hợp để đăng lên Facebook. Sử dụng âm Hán Việt cho tên riêng. Giữ nguyên các thông tin quan trọng. Dùng tối đa 2 emoji. Tránh dùng quá nhiều từ mạnh, văn phong casual một chút.";
           
           let userPrompt = `Viết lại nội dung Weibo sau sang tiếng Việt: "${rawContent}"`;
           
@@ -854,7 +953,7 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
           }
 
           const rewritePromise = nvidia.chat.completions.create({
-            model: "moonshotai/kimi-k2.5",
+            model: "gemini-3-flash-preview",
             messages: [
               {
                 role: "system",
