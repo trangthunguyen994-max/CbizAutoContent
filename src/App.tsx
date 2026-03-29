@@ -40,11 +40,16 @@ export default function App() {
 
   const rewriteWithAI = async (title: string, query?: string, scheme?: string) => {
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout
+      
       const res = await fetch('/api/rewrite', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, query, scheme })
+        body: JSON.stringify({ title, query, scheme }),
+        signal: controller.signal
       });
+      clearTimeout(timeoutId);
       
       if (!res.ok) {
         const errData = await res.json();
@@ -91,7 +96,7 @@ export default function App() {
 
       // Step 1: Fetch latest hot topics from our backend (which crawls Weibo Mobile)
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 120000); // 120s timeout
+      const timeoutId = setTimeout(() => controller.abort(), 180000); // 180s timeout
       
       const response = await fetch(`/api/crawl?category=${category}`, {
         signal: controller.signal
@@ -244,6 +249,7 @@ export default function App() {
         <div className="flex items-center gap-2 mb-8 bg-white p-1.5 rounded-2xl border border-gray-200 w-fit shadow-sm overflow-x-auto">
           {[
             { id: 'entertainment', label: '🎬 Văn hoá - Giải trí (文娱榜)', color: 'text-purple-600 bg-purple-50 border-purple-100' },
+            { id: 'minhtinh', label: '🌟 Minh tinh (明星榜)', color: 'text-pink-600 bg-pink-50 border-pink-100' },
             { id: 'realtime', label: '🔥 Xu hướng (热搜榜)', color: 'text-orange-600 bg-orange-50 border-orange-100' },
             { id: 'social', label: '🏠 Xã hội (社会榜)', color: 'text-blue-600 bg-blue-50 border-blue-100' },
             { id: 'life', label: '🌱 Đời sống (生活榜)', color: 'text-emerald-600 bg-emerald-50 border-emerald-100' }
@@ -383,7 +389,7 @@ export default function App() {
                     <div className="mt-4 flex items-center justify-between text-[11px] text-gray-400 font-medium">
                       <div className="flex items-center gap-1">
                         <ExternalLink className="w-3 h-3" />
-                        <span>Nguồn: Weibo / TopHub</span>
+                        <span>Nguồn: Weibo</span>
                       </div>
                       <span>{new Date(post.created_at).toLocaleString('vi-VN')}</span>
                     </div>

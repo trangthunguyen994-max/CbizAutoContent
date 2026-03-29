@@ -214,6 +214,39 @@ app.get(["/api/crawl", "/api/crawl/"], async (req, res) => {
       console.error("Axios Weibo API failed:", err.message);
     }
 
+    // 1.5 Secondary Source: Weibo Desktop AJAX API (Axios)
+    if (topics.length === 0) {
+      console.log("Primary Axios failed, trying secondary Weibo AJAX API...");
+      try {
+        const ajaxUrl = "https://weibo.com/ajax/side/hotSearch";
+        const response = await axios.get(ajaxUrl, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://weibo.com/"
+          },
+          timeout: 8000
+        });
+        
+        if (response.data && response.data.data && response.data.data.realtime) {
+          for (const item of response.data.data.realtime) {
+            const title = item.word || item.note;
+            if (title && !item.is_ad) {
+               topics.push({
+                 title: String(title).trim(),
+                 query: String(title).trim(),
+                 scheme: `https://s.weibo.com/weibo?q=${encodeURIComponent(title)}`
+               });
+            }
+          }
+        }
+        if (topics.length > 0) {
+          console.log(`Secondary Axios API successfully fetched ${topics.length} topics.`);
+        }
+      } catch (err: any) {
+        console.error("Secondary Axios API failed:", err.message);
+      }
+    }
+
     // 2. Secondary Source: Puppeteer Scraper for s.weibo.com (Fallback)
     if (topics.length === 0) {
       console.log("Axios failed, starting Puppeteer for s.weibo.com Hot Search...");
@@ -245,7 +278,7 @@ app.get(["/api/crawl", "/api/crawl/"], async (req, res) => {
 
         console.log(`Puppeteer navigating to: ${hotSearchUrl}`);
         await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-        await page.goto(hotSearchUrl, { waitUntil: "networkidle2", timeout: 30000 });
+        await page.goto(hotSearchUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
         
         // Wait for the table to load
         await page.waitForSelector(".td-02", { timeout: 10000 }).catch(() => console.log("Timeout waiting for .td-02"));
@@ -286,63 +319,7 @@ app.get(["/api/crawl", "/api/crawl/"], async (req, res) => {
       }
     }
 
-    // 3. Last Resort: Puppeteer Scraper for TopHub (Fallback)
-    if (topics.length === 0) {
-      console.log("s.weibo.com failed, trying TopHub via Puppeteer...");
-      let browser;
-      try {
-        browser = await puppeteer.launch({
-          headless: true,
-          args: ["--no-sandbox", "--disable-setuid-sandbox"],
-          executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
-        });
-        const page = await browser.newPage();
-        
-        let tophubUrl = "https://tophub.today/n/Kq6bwaO0el"; // General
-        if (category === "entertainment") {
-          tophubUrl = "https://tophub.today/n/3QeLwJEd7k";
-        } else if (category === "social") {
-          tophubUrl = "https://tophub.today/n/74Kvx59dkx";
-        } else if (category === "life") {
-          tophubUrl = "https://tophub.today/n/Kq6bwaO0el"; // Life usually in general or specific node
-        }
-
-        console.log(`Puppeteer navigating to TopHub: ${tophubUrl}`);
-        await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-        await page.goto(tophubUrl, { waitUntil: "networkidle2", timeout: 30000 });
-        
-        const scrapedTopics = await page.evaluate(() => {
-          const items: any[] = [];
-          const rows = document.querySelectorAll(".node-list tbody tr");
-          rows.forEach(row => {
-            const titleEl = row.querySelector("td.al a");
-            if (titleEl) {
-              const title = titleEl.textContent?.trim() || "";
-              const href = titleEl.getAttribute("href") || "";
-              if (title && !title.includes("置顶")) {
-                items.push({
-                  title: title,
-                  query: title,
-                  tophubLink: href.startsWith("http") ? href : `https://tophub.today${href}`
-                });
-              }
-            }
-          });
-          return items;
-        });
-        
-        if (scrapedTopics.length > 0) {
-          topics = scrapedTopics;
-          console.log(`Puppeteer (TopHub) successfully scraped ${topics.length} topics.`);
-        }
-      } catch (err: any) {
-        console.error("Puppeteer TopHub scrape failed:", err.message);
-      } finally {
-        if (browser) await browser.close();
-      }
-    }
-
-    // 4. Final Fallback: Weibo Direct APIs (Already tried as #1, but keeping logic for structure)
+    // 3. Final Fallback: Weibo Direct APIs (Already tried as #1, but keeping logic for structure)
     if (topics.length === 0) {
       console.log("All sources failed.");
     }
@@ -515,7 +492,7 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
           const detailUrl = `https://m.weibo.cn/detail/${mblogId}`;
           console.log(`Puppeteer: Found mblogId ${mblogId}, fetching directly: ${detailUrl}`);
           try {
-            await page.goto(detailUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+            await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
             await new Promise(r => setTimeout(r, 2000));
             
             const detailResult = await page.evaluate(() => {
@@ -567,7 +544,7 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
           console.log(`Puppeteer navigating to: ${scrapingUrl}`);
           
           // Đặt timeout dài hơn vì Weibo load khá chậm
-          await page.goto(scrapingUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+          await page.goto(scrapingUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
           // Đợi một chút để JS render hoàn toàn
           await new Promise(r => setTimeout(r, 3000));
@@ -680,7 +657,7 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
                 ? extracted.navigateTo 
                 : `https://m.weibo.cn${extracted.navigateTo}`;
               console.log(`Puppeteer: Found "Full Text" link, navigating to: ${detailUrl}`);
-              await page.goto(detailUrl, { waitUntil: 'networkidle2', timeout: 20000 });
+              await page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
               await new Promise(r => setTimeout(r, 2000));
               
               const detailResult = await page.evaluate(() => {
@@ -744,7 +721,7 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
           await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
           await page.setViewport({ width: 1280, height: 800 });
           
-          await page.goto(desktopSearchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+          await page.goto(desktopSearchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
           await new Promise(r => setTimeout(r, 2000));
 
           const desktopResult = await page.evaluate(() => {
@@ -967,7 +944,7 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
           });
 
           const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error("Rewrite timeout")), 25000)
+            setTimeout(() => reject(new Error("Rewrite timeout")), 45000)
           );
 
           const aiResponse = await Promise.race([rewritePromise, timeoutPromise]) as any;
