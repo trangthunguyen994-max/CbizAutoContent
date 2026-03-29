@@ -247,18 +247,64 @@ app.get(["/api/crawl", "/api/crawl/"], async (req, res) => {
       }
     }
 
+    // 1.7 Third Source: Cheerio Scraper for s.weibo.com (No Browser needed)
+    if (topics.length === 0) {
+      console.log("Axios APIs failed, trying Cheerio HTML scraping for Hot Search...");
+      try {
+        const hotSearchUrl = "https://s.weibo.com/top/summary";
+        const response = await axios.get(hotSearchUrl, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://s.weibo.com/"
+          },
+          timeout: 10000
+        });
+        
+        const $ = cheerio.load(response.data);
+        const scrapedTopics: any[] = [];
+        
+        $(".td-02 a").each((_, el) => {
+          const title = $(el).text().trim();
+          const href = $(el).attr("href") || "";
+          const parent = $(el).closest("tr");
+          const isTop = parent.find(".td-01").text().includes("置顶") || parent.find(".icon-txt").text().includes("荐");
+          
+          if (title && !isTop) {
+            scrapedTopics.push({
+              title: title,
+              query: title,
+              scheme: href.startsWith("http") ? href : `https://s.weibo.com${href}`
+            });
+          }
+        });
+        
+        if (scrapedTopics.length > 0) {
+          topics = scrapedTopics;
+          console.log(`Cheerio successfully scraped ${topics.length} topics.`);
+        }
+      } catch (err: any) {
+        console.error("Cheerio Hot Search scrape failed:", err.message);
+      }
+    }
+
     // 2. Secondary Source: Puppeteer Scraper for s.weibo.com (Fallback)
     if (topics.length === 0) {
-      console.log("Axios failed, starting Puppeteer for s.weibo.com Hot Search...");
+      console.log("Axios & Cheerio failed, starting Puppeteer for s.weibo.com Hot Search...");
       let browser;
       try {
+        console.log("Launching Puppeteer with Render-optimized flags...");
         browser = await puppeteer.launch({
           headless: true,
           args: [
             "--no-sandbox", 
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
-            "--disable-gpu"
+            "--disable-accelerated-2d-canvas",
+            "--no-first-run",
+            "--no-zygote",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--font-render-hinting=none"
           ],
           executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
         });
@@ -396,7 +442,28 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
           }
         }
       } catch (err: any) {
-        console.warn(`Direct fetch failed for ${mblogId}, falling back to search...`);
+        console.warn(`Direct fetch failed for ${mblogId}, trying Desktop AJAX API...`);
+        try {
+          const desktopUrl = `https://weibo.com/ajax/statuses/show?id=${mblogId}`;
+          const response = await axios.get(desktopUrl, {
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+              "Referer": "https://weibo.com/"
+            },
+            timeout: 8000
+          });
+          if (response.data) {
+            const postData = response.data;
+            rawContent = postData.longText?.content || postData.text || "";
+            hasVideo = !!(postData.page_info?.type === 'video');
+            if (postData.pic_ids && postData.pic_infos) {
+              images = postData.pic_ids.map((id: string) => postData.pic_infos[id]?.large?.url || postData.pic_infos[id]?.mw2000?.url);
+            }
+            if (rawContent) console.log(`Axios Desktop API: Found content for ${mblogId}`);
+          }
+        } catch (desktopErr: any) {
+          console.warn(`Desktop AJAX fetch failed for ${mblogId}, falling back to search...`);
+        }
       }
     }
 
@@ -459,11 +526,77 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
       }
     }
 
+    // 3.5 Sử dụng Cheerio để lấy nội dung từ trang search (Không cần trình duyệt)
+    if (!rawContent && query) {
+      console.log(`Trying Cheerio HTML scraping for query: ${query}`);
+      try {
+        const encodedQuery = encodeURIComponent(query).replace(/%20/g, "+");
+        const scrapingUrl = `https://m.weibo.cn/search?containerid=${encodeURIComponent(`100103type=1&q=${encodedQuery}`)}`;
+        
+        const response = await axios.get(scrapingUrl, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+            "Referer": "https://m.weibo.cn/",
+            "X-Requested-With": "XMLHttpRequest"
+          },
+          timeout: 10000
+        });
+
+        const html = response.data;
+        if (typeof html === 'string') {
+          // Thử tìm $render_data trong HTML script
+          const match = html.match(/var\s+\$render_data\s*=\s*(\[[\s\S]*?\])\s*\[0\]/) || 
+                        html.match(/var\s+\$render_data\s*=\s*(\[[\s\S]*?\])/);
+          
+          if (match) {
+            try {
+              const data = JSON.parse(match[1]);
+              const findContent = (obj: any): any => {
+                if (!obj) return null;
+                if (obj.mblog) {
+                  return {
+                    text: obj.mblog.longText?.content || obj.mblog.text || "",
+                    pics: obj.mblog.pics?.map((p: any) => p.large?.url || p.url) || [],
+                    hasVideo: !!(obj.mblog.page_info?.type === 'video' || obj.mblog.mix_media)
+                  };
+                }
+                if (Array.isArray(obj)) {
+                  for (const item of obj) {
+                    const c = findContent(item);
+                    if (c) return c;
+                  }
+                }
+                if (typeof obj === 'object') {
+                  for (const key in obj) {
+                    const c = findContent(obj[key]);
+                    if (c) return c;
+                  }
+                }
+                return null;
+              };
+              const res = findContent(data);
+              if (res && res.text) {
+                rawContent = res.text;
+                images = res.pics || [];
+                hasVideo = res.hasVideo || false;
+                console.log(`Cheerio: Found content in $render_data (Video: ${hasVideo})`);
+              }
+            } catch (e) {
+              console.warn("Cheerio: Failed to parse $render_data");
+            }
+          }
+        }
+      } catch (err: any) {
+        console.warn("Cheerio content scrape failed:", err.message);
+      }
+    }
+
     // 4. Sử dụng Puppeteer để lấy nội dung (Phương án dự phòng cuối cùng)
     if (!rawContent && query) {
       console.log(`Starting Puppeteer fallback for query: ${query}`);
       let browser;
       try {
+        console.log("Launching Puppeteer with Render-optimized flags...");
         browser = await puppeteer.launch({
           headless: true,
           args: [
@@ -473,8 +606,9 @@ app.post(["/api/rewrite", "/api/rewrite/"], async (req, res) => {
             '--disable-accelerated-2d-canvas',
             '--no-first-run',
             '--no-zygote',
-            '--single-process',
-            '--disable-gpu'
+            '--disable-gpu',
+            '--disable-extensions',
+            '--font-render-hinting=none'
           ],
           executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
         });
